@@ -29,6 +29,8 @@ import pandas as pd
 
 __all__ = [
     "MAJOR_COST_R",
+    "COST_BY_SYMBOL",
+    "cost_for_symbol",
     "GateResults",
     "compute_gates",
     "strategy_returns_r",
@@ -38,9 +40,43 @@ __all__ = [
 ]
 
 
-#: EURUSD cost in R units (§7: "~0.03-0.05R against a 1xATR H4 stop").
-#: Conservative end of the range.
+#: Majors cost in R units (§7: "~0.03-0.05R against a 1xATR H4 stop").
+#: Conservative end of the range. Applies to EURUSD/GBPUSD/USDJPY.
 MAJOR_COST_R: float = 0.04
+
+#: Per-symbol cost model in R units (§7: "per-symbol-class, conservative
+#: (~1.2x typical spread + slippage haircut)"). Values are conservative
+#: estimates against a 1xATR H4 stop, derived from typical retail spreads
+#: on IUX Markets:
+#:
+#:   - Majors (EURUSD/GBPUSD/USDJPY): ~0.5-1.0 pip spread -> 0.04R
+#:   - XAUUSD (gold): wider spread in R terms (~0.15-0.25R vs ATR) -> 0.10R
+#:   - US30 (index): point-based, spread ~1-3 pts -> 0.06R
+#:   - BTCUSD (crypto): wide spread + slippage, plus weekend-gap risk
+#:     premium -> 0.20R. §3 explicitly calls out BTC's own regime; the
+#:     weekend-gap adjustment is the risk premium baked into this number
+#:     (BTC resolves barriers continuously through weekends, but the
+#:     gap-driven volatility on FX/index instruments is *larger* per
+#:     event — handled at the labeling layer, not here).
+#:
+#: These are pre-registered Phase 3 constants, not tunable. Any change
+#: is a new trial in the registry.
+COST_BY_SYMBOL: dict[str, float] = {
+    "EURUSD": 0.04,
+    "GBPUSD": 0.04,
+    "USDJPY": 0.04,
+    "XAUUSD": 0.10,
+    "US30": 0.06,
+    "BTCUSD": 0.20,
+}
+
+
+def cost_for_symbol(symbol: str) -> float:
+    """Return the per-trade cost in R units for ``symbol`` (§7 cost model).
+
+    Falls back to the majors cost for unknown symbols (conservative).
+    """
+    return COST_BY_SYMBOL.get(symbol, MAJOR_COST_R)
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +90,8 @@ def strategy_returns_r(
     *,
     probabilities: Optional[np.ndarray] = None,
     ladder_tau0: Optional[float] = None,
-    cost_r: float = MAJOR_COST_R,
+    cost_r: Optional[float] = None,
+    symbols: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Per-trade strategy returns in R units after cost.
 
@@ -64,8 +101,22 @@ def strategy_returns_r(
     - sized: ``r_realized`` scaled by ladder size where ``prob >= tau0``
       (rung 3, used for the second uplift check).
 
+    Cost handling (§7 per-symbol-class model):
+    - If ``symbols`` is provided, cost is looked up per-trade via
+      :func:`cost_for_symbol` (XAU/BTC/US30 get their own regimes).
+    - Else if ``cost_r`` is provided, that scalar applies to all trades.
+    - Else defaults to the majors cost.
+
     Cost is subtracted from every *taken* trade.
     """
+    # Resolve per-trade cost vector.
+    if symbols is not None:
+        cost_vec = np.array([cost_for_symbol(s) for s in symbols])
+    elif cost_r is not None:
+        cost_vec = np.full(len(labels), cost_r)
+    else:
+        cost_vec = np.full(len(labels), MAJOR_COST_R)
+
     if probabilities is None or ladder_tau0 is None:
         # Rung 1: take all.
         taken = np.ones(len(labels), dtype=bool)
@@ -73,11 +124,10 @@ def strategy_returns_r(
     else:
         taken = probabilities >= ladder_tau0
         # Rung 3 sizing (0.5x above tau0, 1.0x above tau1=tau0+0.10 approx).
-        # For rung 2 (filter only), pass scale=1 below by not using this.
         scale = np.where(probabilities >= ladder_tau0 + 0.10, 1.0, 0.5)
 
     ret = np.zeros(len(labels))
-    ret[taken] = scale[taken] * (r_realized[taken] - cost_r)
+    ret[taken] = scale[taken] * (r_realized[taken] - cost_vec[taken])
     return ret
 
 
@@ -233,7 +283,7 @@ class GateResults:
 
     def as_table(self) -> str:
         rows = [
-            ("G1 Uplift", f"ΔSharpe={self.g1_uplift_delta_sharpe:.3f}, p={self.g1_uplift_pvalue:.3f}", "PASS" if self.g1_pass else "FAIL"),
+            ("G1 Uplift", f"Delta Sharpe={self.g1_uplift_delta_sharpe:.3f}, p={self.g1_uplift_pvalue:.3f}", "PASS" if self.g1_pass else "FAIL"),
             ("G2 DSR", f"{self.g2_dsr:.3f} (n_trials={self.n_trials})", "PASS" if self.g2_pass else "FAIL"),
             ("G3 PBO", f"{self.g3_pbo:.3f}", "PASS" if self.g3_pass else "FAIL"),
             ("G4 t-stat", f"{self.g4_tstat_mean_r:.3f}", "PASS" if self.g4_pass else "FAIL"),

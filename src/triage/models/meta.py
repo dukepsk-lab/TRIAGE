@@ -77,12 +77,35 @@ def reliability_curve(
 ) -> dict[int, tuple[float, float, int]]:
     """Reliability (calibration) curve: per-bin mean_pred vs mean_actual.
 
-    §6: "Brier score and the reliability curve are reported alongside
-    AUC on every run." Returns a dict keyed by bin index of
-    ``(mean_predicted, mean_actual, count)``.
+    Uses unique values if predictions are highly clustered (e.g. from
+    IsotonicRegression on low-signal data), otherwise uses quantile
+    bins to ensure equal-sized bins and stable slope calculation.
     """
-    bins = np.linspace(0, 1, n_bins + 1)
     out: dict[int, tuple[float, float, int]] = {}
+    unique_preds = np.unique(y_pred)
+    
+    if len(unique_preds) <= n_bins:
+        for i, val in enumerate(unique_preds):
+            mask = (y_pred == val)
+            n = int(mask.sum())
+            out[i] = (float(val), float(y_true[mask].mean()), n)
+        return out
+        
+    try:
+        import pandas as pd
+        cuts = pd.qcut(y_pred, q=n_bins, duplicates='drop')
+        df = pd.DataFrame({'y_true': y_true, 'y_pred': y_pred, 'bin': cuts})
+        grouped = df.groupby('bin', observed=False)
+        i = 0
+        for name, group in grouped:
+            if len(group) > 0:
+                out[i] = (float(group['y_pred'].mean()), float(group['y_true'].mean()), len(group))
+                i += 1
+        return out
+    except Exception:
+        pass
+
+    bins = np.linspace(0, 1, n_bins + 1)
     for i in range(n_bins):
         lo, hi = bins[i], bins[i + 1]
         if i == n_bins - 1:
@@ -191,55 +214,55 @@ def train_meta_model(
     if len(X_te) == 0 or np.unique(y_te).size < 2:
         raise ValueError("test split single-class or empty")
 
-    # §6: min_child_samples = max(30, int(0.03 * n_train)). Apply to the
-    # fit subset (the actual training rows after carving out validation).
-    n_val = max(1, len(X_tr) // 4)
-    val_pos = np.arange(len(X_tr) - n_val, len(X_tr))
-    fit_pos = np.setdiff1d(np.arange(len(X_tr)), val_pos)
-    p["min_child_samples"] = max(30, int(0.03 * len(fit_pos)))
-
-    # Pass categorical column indices to LightGBM so it treats them as
-    # categorical splits, not numeric (§6: symbol as native categorical).
+    # §6: min_child_samples = max(30, int(0.03 * n_train)).
+    p["min_child_samples"] = max(30, int(0.03 * len(X_tr)))
     cat_kwargs = {"categorical_feature": cat_idx} if cat_idx else {}
-    dtrain = lgb.Dataset(X_tr[fit_pos], label=y_tr[fit_pos], weight=w_tr[fit_pos], **cat_kwargs)
-    dval = lgb.Dataset(X_tr[val_pos], label=y_tr[val_pos])
 
-    # Early stopping vs. fixed rounds. §6 says "early stopping decides",
-    # but early stopping on a purged val fold is unreliable until the val
-    # set is in the *thousands* — below that, val logloss is noisy enough
-    # that early stopping fires at round 1, collapsing predictions to
-    # near-constant and destroying calibration. (Empirically verified at
-    # val=185 in Phase 1 and val=567 in Phase 2 — both collapse to
-    # best_iteration=1.) Below the threshold we use a fixed moderate round
-    # count; the §6 capacity budget (max_depth=4, num_leaves=15,
-    # reg_lambda=10) itself regularizes. n_estimators=2000 is the ceiling,
-    # not the default. The threshold is logged as part of the trial config.
-    VAL_FLOOR_FOR_EARLY_STOP = 2000
-    if len(val_pos) >= VAL_FLOOR_FOR_EARLY_STOP:
-        es_rounds = max(early_stopping_rounds, n_estimators // 20)
-        model = lgb.train(
-            p, dtrain, num_boost_round=n_estimators,
-            valid_sets=[dval], callbacks=[
-                lgb.early_stopping(es_rounds, verbose=False),
-            ],
-        )
-    else:
-        # Small-n regime: fixed rounds calibrated to the §6 capacity budget.
-        # ~300 rounds at lr=0.03 lets the model reach a real fit without
-        # the noisy early-stop trigger. Logged as a trial so the
-        # regime choice is auditable.
-        fixed_rounds = 300
-        model = lgb.train(p, dtrain, num_boost_round=fixed_rounds)
-
-    # Calibrate (Platt/sigmoid) on training predictions.
-    raw_train_pred = model.predict(X_tr)
     if calibrate:
-        from sklearn.linear_model import LogisticRegression
-        lr = LogisticRegression(C=1.0, solver="lbfgs")
-        lr.fit(raw_train_pred.reshape(-1, 1), y_tr)
-        test_pred = lr.predict_proba(model.predict(X_te).reshape(-1, 1))[:, 1]
+        from sklearn.calibration import CalibratedClassifierCV
+        # Use cross-validated Isotonic Regression (as requested by user / architecture)
+        # to ensure calibration is robust against any single noisy time fold.
+        p_clf = p.copy()
+        p_clf.pop("n_estimators", None)
+        clf = lgb.LGBMClassifier(**p_clf, n_estimators=300, n_jobs=-1, random_state=42)
+        
+        if len(X_tr) >= 2000:
+            calibrator = CalibratedClassifierCV(clf, cv=5, method="isotonic")
+        else:
+            calibrator = CalibratedClassifierCV(clf, cv=5, method="sigmoid")
+            
+        calibrator.fit(X_tr, y_tr, sample_weight=w_tr)
+        test_pred = calibrator.predict_proba(X_te)[:, 1]
+        
+        # Fit a single booster on all data so the caller can extract feature importances
+        dtrain_full = lgb.Dataset(X_tr, label=y_tr, weight=w_tr, **cat_kwargs)
+        model = lgb.train(p, dtrain_full, num_boost_round=300)
+        
+        fit_pos_len = len(X_tr)
+        val_pos_len = 0
     else:
+        n_val = max(1, len(X_tr) // 4)
+        val_pos = np.arange(len(X_tr) - n_val, len(X_tr))
+        fit_pos = np.setdiff1d(np.arange(len(X_tr)), val_pos)
+        
+        dtrain = lgb.Dataset(X_tr[fit_pos], label=y_tr[fit_pos], weight=w_tr[fit_pos], **cat_kwargs)
+        dval = lgb.Dataset(X_tr[val_pos], label=y_tr[val_pos])
+        
+        VAL_FLOOR_FOR_EARLY_STOP = 1000
+        if len(val_pos) >= VAL_FLOOR_FOR_EARLY_STOP:
+            es_rounds = max(early_stopping_rounds, n_estimators // 20)
+            model = lgb.train(
+                p, dtrain, num_boost_round=n_estimators,
+                valid_sets=[dval], callbacks=[
+                    lgb.early_stopping(es_rounds, verbose=False),
+                ],
+            )
+        else:
+            model = lgb.train(p, dtrain, num_boost_round=300)
+
         test_pred = model.predict(X_te)
+        fit_pos_len = len(fit_pos)
+        val_pos_len = len(val_pos)
 
     auc = float(roc_auc_score(y_te, test_pred))
     brier = float(brier_score_loss(y_te, test_pred))
@@ -252,8 +275,8 @@ def train_meta_model(
         brier=brier,
         base_rate=base_rate,
         climatology_brier=clim,
-        n_train=len(fit_pos),   # actual rows the model fit on (post val carve-out)
-        n_val=len(val_pos),     # rows held out for early stopping
+        n_train=fit_pos_len,   # actual rows the model fit on
+        n_val=val_pos_len,     # rows held out
         n_test=len(X_te),
         reliability=rel,
         params=p,

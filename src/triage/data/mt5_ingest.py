@@ -50,6 +50,9 @@ __all__ = [
     "BarRange",
     "BROKER_SYMBOL_MAP",
     "PHASE2_SYMBOLS",
+    "PHASE3_SYMBOLS",
+    "ALL_SYMBOLS",
+    "WEEKEND_TRADING_SYMBOLS",
     "fetch_range",
     "ingest_symbol",
     "ingest_eurusd_phase1",
@@ -67,18 +70,38 @@ DEFAULT_BAR_DB: Path = Path(".triage") / "bars.sqlite"
 # ---------------------------------------------------------------------------
 
 #: Map canonical symbol -> broker symbol string. Broker suffixes change
-#: per broker; IUX Markets Live uses a trailing dot for the three Phase 2
-#: majors (verified empirically). Internal storage is always the canonical
-#: form (no suffix); mapping happens at the adapter boundary.
+#: per broker; IUX Markets Live uses a trailing dot (verified empirically).
+#: Internal storage is always the canonical form (no suffix); mapping
+#: happens at the adapter boundary.
 BROKER_SYMBOL_MAP: dict[str, str] = {
     "EURUSD": "EURUSD.",
     "GBPUSD": "GBPUSD.",
     "USDJPY": "USDJPY.",
+    "XAUUSD": "XAUUSD.",
+    "US30": "US30.",
+    "BTCUSD": "BTCUSD.",
 }
 
 #: The Phase 2 majors pool (§10 Phase 2: "Pool EURUSD/GBPUSD/USDJPY").
 #: All three are majors -> same cost class (~0.03-0.05R, §7).
 PHASE2_SYMBOLS: tuple[str, ...] = ("EURUSD", "GBPUSD", "USDJPY")
+
+#: The Phase 3 additions (§10 Phase 3: "Add XAUUSD/US30/BTCUSD").
+PHASE3_SYMBOLS: tuple[str, ...] = ("XAUUSD", "US30", "BTCUSD")
+
+#: Full Phase 3 basket (6 symbols).
+ALL_SYMBOLS: tuple[str, ...] = PHASE2_SYMBOLS + PHASE3_SYMBOLS
+
+#: Instruments that genuinely trade on weekends (continuous 24/7 market).
+#: Only BTCUSD among the basket. FX, gold, and US indices close Friday
+#: evening -> Sunday/Monday open (a discontinuous weekend gap). The
+#: weekend-gap handling in the rule engine + labeler keys off this set:
+#: for non-weekend instruments, an event open on Friday resolves barriers
+#: against M1 bars that *skip* the weekend (the Friday close -> Monday
+#: open is a jump, not a continuous path); BTCUSD resolves continuously.
+#: (§3 Phase 3: "BTC also needs a weekend-gap adjustment — don't let it
+#: silently misprice barriers over weekend gaps.")
+WEEKEND_TRADING_SYMBOLS: frozenset[str] = frozenset({"BTCUSD"})
 
 #: Reverse lookup.
 CANONICAL_TO_BROKER: dict[str, str] = {v: k for k, v in BROKER_SYMBOL_MAP.items()}

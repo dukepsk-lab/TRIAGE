@@ -34,6 +34,10 @@ from .data.mt5_ingest import DEFAULT_BAR_DB, TF_M1, load_bars
 from .features import FEATURE_COLUMNS, FeatureContext, compute_snapshot, feature_hash
 from .labeling import Event, LabeledEvent, VERTICAL_BARS, label_event, make_event
 from .rules import DonchianSignal, RULE_VERSION
+from .rules.pullback import PullbackSignal
+
+from typing import Union
+SignalType = Union[DonchianSignal, PullbackSignal]
 
 __all__ = [
     "DEFAULT_EVENTS_DB",
@@ -99,7 +103,7 @@ def _atr_at(h4_pre: pd.DataFrame, period: int = 14) -> float:
 
 
 def label_one_event(
-    signal: DonchianSignal,
+    signal: SignalType,
     *,
     h4: pd.DataFrame,
     d1: pd.DataFrame,
@@ -188,7 +192,7 @@ class _LabeledWithFeatures:
 
 
 def build_events_for_signals(
-    signals: list[DonchianSignal],
+    signals: list[SignalType],
     *,
     h4: pd.DataFrame,
     d1: pd.DataFrame,

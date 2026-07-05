@@ -27,6 +27,12 @@ from .donchian_backfill import (  # noqa: F401
     d1_slope_at_h4_close,
     replay_history,
 )
+from . import pullback as pullback_rule  # noqa: F401  Phase 3 second family
+from .pullback import (  # noqa: F401
+    PULLBACK_RULE_VERSION,
+    PullbackConfig,
+    PullbackSignal,
+)
 
 # Phase 0 stub retained for the synthetic labeler tests.
 from .stub import RULE_VERSION as TRIVIAL_RULE_VERSION  # noqa: F401
