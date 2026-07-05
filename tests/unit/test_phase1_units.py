@@ -92,43 +92,50 @@ def test_ev_formula_matches_section_8():
 
 
 def test_ladder_zero_below_tau0():
-    """No trade below tau0."""
-    lad = SizingLadder(tau0=0.47, tau1=0.55)
+    """No trade below tau0.
+
+    tau0 is derived from cost via ``default_tau0(cost_r)`` — at the default
+    cost 0.04 that is ~0.466, so both 0.40 and 0.46 sit below it.
+    """
+    lad = SizingLadder(tau1_margin=0.08)
     assert lad.size(0.40) == 0.0
     assert lad.size(0.46) == 0.0
 
 
 def test_ladder_half_between_tau0_and_tau1():
     """Half base_risk in [tau0, tau1)."""
-    lad = SizingLadder(tau0=0.47, tau1=0.55, base_risk=0.01)
+    lad = SizingLadder(tau1_margin=0.08, base_risk=0.01)
+    # tau0 ~= 0.466, tau1 ~= 0.546 -> 0.50 lands in the half-size rung.
     assert lad.size(0.50) == pytest.approx(0.005)
 
 
 def test_ladder_full_above_tau1():
     """Full base_risk at/above tau1."""
-    lad = SizingLadder(tau0=0.47, tau1=0.55, base_risk=0.01)
+    lad = SizingLadder(tau1_margin=0.08, base_risk=0.01)
+    # tau1 ~= 0.546 -> 0.55 and 0.70 are both at/above it.
     assert lad.size(0.55) == pytest.approx(0.01)
     assert lad.size(0.70) == pytest.approx(0.01)
 
 
 def test_ladder_atr_overlay_halves_size():
     """§8 hard overlay: ATR percentile > 95 -> halve size."""
-    lad = SizingLadder(tau0=0.47, tau1=0.55, base_risk=0.01)
+    lad = SizingLadder(tau1_margin=0.08, base_risk=0.01)
     assert lad.size(0.60, atr_percentile=0.96) == pytest.approx(0.005)
     # Below the 95 threshold -> no overlay.
     assert lad.size(0.60, atr_percentile=0.94) == pytest.approx(0.01)
 
 
 def test_select_tau_on_train_picks_positive_ev_tau1():
-    """tau1 selection should pick a candidate that yields positive EV."""
+    """tau1-margin selection should yield a positive-margin ladder over tau0."""
     rng = np.random.default_rng(0)
     # Synthesize probs correlated with a positive-outcome label so EV>0
     # above some threshold.
     probs = rng.uniform(0.3, 0.8, 500)
     labels = (probs + rng.normal(0, 0.15, 500) > 0.55).astype(int)
     lad = select_tau_on_train(probs, labels)
-    assert lad.tau0 > 0.40  # break-even-ish
-    assert lad.tau1 > lad.tau0
+    # tau0 is formula-fixed from cost (break-even-ish); tau1 sits above it.
+    assert default_tau0(0.04) > 0.40
+    assert lad.tau1_margin > 0.0
 
 
 # ---------------------------------------------------------------------------
