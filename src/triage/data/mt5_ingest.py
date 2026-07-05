@@ -48,9 +48,12 @@ __all__ = [
     "TF_M1",
     "TF_D1",
     "BarRange",
+    "BROKER_SYMBOL_MAP",
+    "PHASE2_SYMBOLS",
     "fetch_range",
     "ingest_symbol",
     "ingest_eurusd_phase1",
+    "ingest_symbols",
     "load_bars",
     "coverage_report",
 ]
@@ -64,11 +67,18 @@ DEFAULT_BAR_DB: Path = Path(".triage") / "bars.sqlite"
 # ---------------------------------------------------------------------------
 
 #: Map canonical symbol -> broker symbol string. Broker suffixes change
-#: per broker; IUX Markets Live uses ``EURUSD.`` (with a trailing dot).
-#: Internal storage is always the canonical form (no suffix).
+#: per broker; IUX Markets Live uses a trailing dot for the three Phase 2
+#: majors (verified empirically). Internal storage is always the canonical
+#: form (no suffix); mapping happens at the adapter boundary.
 BROKER_SYMBOL_MAP: dict[str, str] = {
     "EURUSD": "EURUSD.",
+    "GBPUSD": "GBPUSD.",
+    "USDJPY": "USDJPY.",
 }
+
+#: The Phase 2 majors pool (§10 Phase 2: "Pool EURUSD/GBPUSD/USDJPY").
+#: All three are majors -> same cost class (~0.03-0.05R, §7).
+PHASE2_SYMBOLS: tuple[str, ...] = ("EURUSD", "GBPUSD", "USDJPY")
 
 #: Reverse lookup.
 CANONICAL_TO_BROKER: dict[str, str] = {v: k for k, v in BROKER_SYMBOL_MAP.items()}
@@ -422,14 +432,60 @@ def ingest_eurusd_phase1(
     return out
 
 
+def ingest_symbols(
+    symbols: Iterable[str] = PHASE2_SYMBOLS,
+    *,
+    start: datetime = datetime(2015, 1, 1, tzinfo=timezone.utc),
+    end: Optional[datetime] = None,
+    timeframes: Iterable[str] = (TF_D1, TF_H4, TF_M1),
+    db_path: Path = DEFAULT_BAR_DB,
+    progress: bool = True,
+) -> dict[str, dict[str, Coverage]]:
+    """Multi-symbol ingest (Phase 2). Loops :func:`ingest_eurusd_phase1`-style
+    fetch+persist over each canonical symbol in ``symbols``.
+
+    Returns ``{symbol: {timeframe: Coverage}}``. EURUSD is a no-op
+    re-ingest if already present (INSERT OR REPLACE is idempotent), so
+    calling this in Phase 2 tops up GBPUSD + USDJPY without re-fetching
+    EURUSD's M1 backfill.
+    """
+    end = end or datetime.now(tz=timezone.utc)
+    out: dict[str, dict[str, Coverage]] = {}
+    for sym in symbols:
+        if progress:
+            print(f"[ingest] === {sym} ===", flush=True)
+        sym_cov: dict[str, Coverage] = {}
+        for tf in timeframes:
+            if progress:
+                print(f"[ingest] {sym} {tf} {start.date()} -> {end.date()} ...", flush=True)
+            bar_range = fetch_range(sym, tf, start, end)
+            n = ingest_symbol(bar_range, db_path=db_path)
+            cov = coverage_report(sym, tf, db_path=db_path)
+            if progress:
+                print(
+                    f"[ingest]   wrote {n} bars; coverage: "
+                    f"{cov.first} -> {cov.last} ({cov.years}y, gap_ratio={cov.gap_ratio})",
+                    flush=True,
+                )
+            sym_cov[tf] = cov
+        out[sym] = sym_cov
+    return out
+
+
 if __name__ == "__main__":  # pragma: no cover - CLI entry
     import argparse
 
-    p = argparse.ArgumentParser(description="Ingest EURUSD bars from MT5.")
+    p = argparse.ArgumentParser(description="Ingest bars from MT5.")
     p.add_argument("--start", default="2015-01-01", help="ISO date, default 2015-01-01")
+    p.add_argument(
+        "--symbols",
+        default="EURUSD,GBPUSD,USDJPY",
+        help="Comma-separated canonical symbols (default EURUSD,GBPUSD,USDJPY)",
+    )
     p.add_argument(
         "--db", default=str(DEFAULT_BAR_DB), help="SQLite path (default .triage/bars.sqlite)"
     )
     args = p.parse_args()
     start = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc)
-    ingest_eurusd_phase1(start=start, db_path=Path(args.db))
+    syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    ingest_symbols(syms, start=start, db_path=Path(args.db))

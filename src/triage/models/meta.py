@@ -153,14 +153,33 @@ def train_meta_model(
     if params:
         p.update(params)
 
-    X = features.to_numpy()
     y = labels.to_numpy().astype(int)
     w = sample_weight.to_numpy() if sample_weight is not None else np.ones(len(features))
+
+    # Handle categorical columns (§6: "Symbol ... enter as native
+    # categoricals"). pandas Categorical dtype must be converted to integer
+    # codes for LightGBM, and the column indices passed via
+    # ``categorical_feature`` so the model treats them as categorical, not
+    # numeric. Test-set categoricals are aligned to the training category
+    # levels by the caller.
+    cat_cols = [
+        c for c in features.columns
+        if isinstance(features[c].dtype, pd.CategoricalDtype)
+    ]
+    cat_idx = [list(features.columns).index(c) for c in cat_cols]
+
+    def _to_codes(df: pd.DataFrame) -> np.ndarray:
+        out = df.copy()
+        for c in cat_cols:
+            out[c] = out[c].cat.codes
+        return out.to_numpy(dtype=np.float64)
+
+    X = _to_codes(features)
 
     # Determine the test set: explicit (preferred) or implicit naive split.
     if test_features is not None and test_labels is not None:
         X_tr, y_tr, w_tr = X, y, w
-        X_te = test_features.to_numpy()
+        X_te = _to_codes(test_features)
         y_te = test_labels.to_numpy().astype(int)
     else:
         n = len(features)
@@ -178,19 +197,23 @@ def train_meta_model(
     fit_pos = np.setdiff1d(np.arange(len(X_tr)), val_pos)
     p["min_child_samples"] = max(30, int(0.03 * len(fit_pos)))
 
-    dtrain = lgb.Dataset(X_tr[fit_pos], label=y_tr[fit_pos], weight=w_tr[fit_pos])
+    # Pass categorical column indices to LightGBM so it treats them as
+    # categorical splits, not numeric (§6: symbol as native categorical).
+    cat_kwargs = {"categorical_feature": cat_idx} if cat_idx else {}
+    dtrain = lgb.Dataset(X_tr[fit_pos], label=y_tr[fit_pos], weight=w_tr[fit_pos], **cat_kwargs)
     dval = lgb.Dataset(X_tr[val_pos], label=y_tr[val_pos])
 
     # Early stopping vs. fixed rounds. §6 says "early stopping decides",
-    # but at single-symbol Phase 1 n (~hundreds of training rows) the
-    # purged val set is small enough that val logloss is noisy and early
-    # stopping fires at round 1 — collapsing predictions to near-
-    # constant and destroying calibration. Below a val-size threshold we
-    # fall back to a fixed moderate round count (the §6 capacity budget
-    # itself regularizes; n_estimators=2000 is the ceiling, not the
-    # default). Above the threshold, normal early stopping with scaled
-    # patience.
-    VAL_FLOOR_FOR_EARLY_STOP = 500
+    # but early stopping on a purged val fold is unreliable until the val
+    # set is in the *thousands* — below that, val logloss is noisy enough
+    # that early stopping fires at round 1, collapsing predictions to
+    # near-constant and destroying calibration. (Empirically verified at
+    # val=185 in Phase 1 and val=567 in Phase 2 — both collapse to
+    # best_iteration=1.) Below the threshold we use a fixed moderate round
+    # count; the §6 capacity budget (max_depth=4, num_leaves=15,
+    # reg_lambda=10) itself regularizes. n_estimators=2000 is the ceiling,
+    # not the default. The threshold is logged as part of the trial config.
+    VAL_FLOOR_FOR_EARLY_STOP = 2000
     if len(val_pos) >= VAL_FLOOR_FOR_EARLY_STOP:
         es_rounds = max(early_stopping_rounds, n_estimators // 20)
         model = lgb.train(
