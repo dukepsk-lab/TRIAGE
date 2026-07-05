@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "triage"
+version = "0.0.1"
+description = "TRIAGE — Triple-Barrier Meta-Label Architecture. Phase 0: harness correctness."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "dukepsk-lab" }]
+dependencies = [
+    # Core scientific stack
+    "numpy>=1.26",
+    "pandas>=2.1",
+    # Meta-model (used in the shuffled-label leakage harness)
+    "lightgbm>=4.1",
+    "scikit-learn>=1.3",  # roc_auc_score, calibration
+    # MT5 data ingest (Windows-only; authorized for this build)
+    "MetaTrader5>=5.0.43 ; platform_system == 'Windows'",
+    # Local trial registry + bar store
+    "pytest>=7.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/triage"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra -q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

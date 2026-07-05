@@ -1,0 +1,32 @@
+# TimescaleDB service for TRIAGE — staged for later phases.
+#
+# Phase 0 uses synthetic data only (ARCHITECTURE.md §10); this service is
+# NOT started in Phase 0 and exists purely so the Phase 1 plumbing (H4/M1
+# bar hypertables, the `events` table from §4) has a target to migrate
+# against. Do not stand it up this session.
+#
+# Usage (Phase 1+):
+#   docker compose up -d timescaledb
+#   # then run migrations under scripts/ (to be added in Phase 1)
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: triage-tsdb
+    environment:
+      POSTGRES_USER: triage
+      POSTGRES_PASSWORD: triage
+      POSTGRES_DB: triage
+    ports:
+      - "5433:5432"   # 5433 on host to avoid clashing with a local pg
+    volumes:
+      - triage-tsdb-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U triage -d triage"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  triage-tsdb-data:

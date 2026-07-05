@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# uv
+# NOTE: uv.lock is intentionally COMMITTED for reproducibility (pins
+# exact dependency versions). Do not ignore it.
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Trial registry (local SQLite, Phase 0+)
+.triage/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local scratch
+*.sqlite
+*.sqlite-journal
+/tmp/
