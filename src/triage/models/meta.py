@@ -64,7 +64,8 @@ class MetaModelResult:
     brier: float
     base_rate: float
     climatology_brier: float
-    n_train: int
+    n_train: int                # ACTUAL fit-subset size (post val carve-out)
+    n_val: int                  # rows held out for early-stopping/val (0 if fixed rounds)
     n_test: int
     reliability: dict  # bin -> (mean_pred, mean_actual, count)
     params: dict
@@ -251,7 +252,8 @@ def train_meta_model(
         brier=brier,
         base_rate=base_rate,
         climatology_brier=clim,
-        n_train=len(X_tr),
+        n_train=len(fit_pos),   # actual rows the model fit on (post val carve-out)
+        n_val=len(val_pos),     # rows held out for early stopping
         n_test=len(X_te),
         reliability=rel,
         params=p,

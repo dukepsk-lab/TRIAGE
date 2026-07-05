@@ -97,8 +97,10 @@ What the numbers say:
   "0.53–0.56" band. The shuffled-label harness confirms this is real
   signal, not a leak (permuted-label AUCs ≈ 0.50).
 - **The probability ranking has economic content.** The EV-vs-τ curve
-  is monotonically increasing: mean R after cost rises from +0.07 at
-  τ=0.30 to **+0.17 at τ=0.70**. Higher-conviction trades pay more.
+  shows a rising overall trend: mean R after cost rises from +0.07 at
+  τ=0.30 to **+0.17 at τ=0.70**. The curve is noisy at small per-bin n
+  (local drops at τ≈0.38 and τ≈0.53), but the economically meaningful
+  signal — higher-conviction trades pay more on average — survives.
 - **G1 uplift is favorable but just misses 95% confidence.**
   ΔSharpe = +1.232 (large and positive), p = 0.059 (one tick above
   the 0.05 bar). At single-symbol n this is right at the edge of
