@@ -82,21 +82,22 @@ class SizingLadder:
         return size
 
 
-def get_cost_r(symbol: str, t0: Optional[datetime] = None) -> float:
-    """Return the conservative cost in R units for a symbol."""
-    if symbol in ("EURUSD", "GBPUSD", "USDJPY"):
-        return 0.04
-    elif symbol == "XAUUSD":
-        return 0.06
-    elif symbol == "US30":
-        return 0.05
-    elif symbol == "BTCUSD":
-        # §7: BTC additionally a weekend-gap adjustment
-        cost = 0.08
-        if t0 is not None and t0.weekday() >= 4: # Friday or weekend
-            cost += 0.04
-        return cost
-    return DEFAULT_COST_R
+def get_cost_r(symbol: str, t0: object = None) -> float:
+    """Return the conservative per-symbol cost in R units (§7 cost model).
+
+    Single source of truth: delegates to :func:`triage.gates.cost_for_symbol`
+    so the sizer and the gates never disagree on cost. (An earlier draft kept
+    a second, divergent table here — XAU/US30/BTC values that contradicted
+    ``gates.COST_BY_SYMBOL`` — which is the exact self-deception §7 warns
+    about when it says "gating on pre-cost numbers is self-deception".)
+
+    The ``t0`` argument is retained for call-site back-compat but ignored:
+    §7's BTC weekend-gap premium is baked into the flat ``COST_BY_SYMBOL``
+    value, not applied per-timestamp here.
+    """
+    from ..gates import cost_for_symbol
+
+    return cost_for_symbol(symbol)
 
 
 def select_tau_on_train(

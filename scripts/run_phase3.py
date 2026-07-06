@@ -151,6 +151,12 @@ def train_pooled(train: pd.DataFrame, test: pd.DataFrame, registry: TrialRegistr
         res = train_meta_model(
             X_tr_raw, y_tr, sample_weight=w,
             test_features=X_te_raw, test_labels=y_te,
+            # §6: calibrate on a dedicated purged calibration fold rather than
+            # internal CV over the training data. ``events`` (t0/t1, aligned to
+            # the training rows) lets the calibration fold be purged of fit
+            # rows whose label span reaches into it.
+            events=train[["t0", "t1"]],
+            calibration="holdout",
             params={"max_depth": 6, "num_leaves": 31, "learning_rate": 0.02},
             n_estimators=1000,
         )
@@ -253,12 +259,22 @@ def main() -> None:
     oos_se = float(taken.std() / np.sqrt(len(taken))) if len(taken) > 1 else 1.0
     obs_sharpe = float(primary_ret.mean() / primary_ret.std() * np.sqrt(252)) if primary_ret.std() > 0 else 0.0
     
-    from triage.models.meta import reliability_curve
-    rel = reliability_curve(out["test_labels"], res.oof_pred, n_bins=8)
-    xs = [mp for mp, ma, n in rel.values() if n > 0 and not np.isnan(mp)]
-    ys = [ma for mp, ma, n in rel.values() if n > 0 and not np.isnan(ma)]
-    rel_slope = float(np.polyfit(xs, ys, 1)[0]) if len(xs) >= 2 else 0.0
-    
+    from triage.models.meta import reliability_slope
+    rel_slope = reliability_slope(out["test_labels"], res.oof_pred, n_bins=8)
+
+    # Per-symbol calibration attribution: is one symbol dragging the pooled
+    # reliability slope? Delete a symbol only if its OWN slope is the outlier,
+    # not because it happens to nudge a gate — that would be basket-overfitting
+    # (§0 "every tuned knob is a trial"; §10 "no single symbol carrying the book").
+    print("\n--- Per-Symbol Calibration (reliability slope, target [0.8, 1.2]) ---")
+    for sym in sorted(set(out["test_symbols"])):
+        mask = out["test_symbols"] == sym
+        if int(mask.sum()) < 20 or len(set(out["test_labels"][mask])) < 2:
+            print(f"  {sym}: n={int(mask.sum())} (too few / single-class — skipped)")
+            continue
+        s = reliability_slope(out["test_labels"][mask], res.oof_pred[mask], n_bins=6)
+        print(f"  {sym}: n={int(mask.sum())}  slope={s:.3f}")
+
     n_trials = len(reg)
     gates = compute_gates(
         primary_returns_r=primary_ret,

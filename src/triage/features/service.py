@@ -70,7 +70,8 @@ __all__ = [
 #   d1_roc_5           D1 5-bar ROC
 #   hour_utc           hour-of-day (seasonality; categorical in Phase 2)
 #
-# Total: 16 columns. Tier 4 (cross-sectional) enters at Phase 3 only.
+# Total: 15 columns (5 Tier 1 + 6 Tier 2 + 4 Tier 3), within the §5
+# "~14-16 columns" band. Tier 4 (cross-sectional) enters at Phase 3 only.
 # ---------------------------------------------------------------------------
 
 FEATURE_COLUMNS: list[str] = [

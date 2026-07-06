@@ -30,6 +30,7 @@ __all__ = [
     "MetaModelResult",
     "train_meta_model",
     "reliability_curve",
+    "reliability_slope",
 ]
 
 
@@ -120,6 +121,24 @@ def reliability_curve(
     return out
 
 
+def reliability_slope(y_true: np.ndarray, y_pred: np.ndarray, n_bins: int = 8) -> float:
+    """Slope of the reliability curve (mean_actual regressed on mean_pred).
+
+    G5 (§7) requires this in ``[0.8, 1.2]``. A slope near 1 is well
+    calibrated; a shallow slope (toward 0) is the signature of a calibrator
+    that has collapsed predictions toward a constant — which also drives the
+    Brier score up toward climatology. Returns 0.0 when fewer than two
+    populated bins exist (undefined slope, treated as a hard calibration
+    failure by the gate).
+    """
+    rel = reliability_curve(np.asarray(y_true), np.asarray(y_pred), n_bins=n_bins)
+    xs = [mp for mp, ma, n in rel.values() if n > 0 and not np.isnan(mp)]
+    ys = [ma for mp, ma, n in rel.values() if n > 0 and not np.isnan(ma)]
+    if len(xs) < 2:
+        return 0.0
+    return float(np.polyfit(xs, ys, 1)[0])
+
+
 def train_meta_model(
     features: pd.DataFrame,
     labels: pd.Series,
@@ -132,6 +151,8 @@ def train_meta_model(
     n_estimators: int = 2000,
     early_stopping_rounds: int = 100,
     calibrate: bool = True,
+    calibration: str = "cv",
+    calib_frac: float = 0.2,
     seed: int = 0,
 ) -> MetaModelResult:
     """Train the LightGBM meta-model with purged OOS evaluation.
@@ -159,8 +180,31 @@ def train_meta_model(
         params: Override :data:`DEFAULT_PARAMS`.
         n_estimators: Max boost rounds (early stopping decides actual).
         early_stopping_rounds: Early stop patience on the held-out val.
-        calibrate: Fit Platt sigmoid on training predictions.
+        calibrate: Whether to calibrate probabilities at all.
+        calibration: Calibration strategy when ``calibrate`` is True:
+
+            * ``"cv"`` (default, back-compat): ``CalibratedClassifierCV``
+              with internal 5-fold CV over the training data. Reproduces the
+              Phase 1/2 runs. Prone to collapsing predictions toward the
+              base rate at small n (Brier -> climatology, shallow slope).
+            * ``"holdout"`` (§6 "fit on a purged calibration fold"): carve a
+              time-ordered tail of the training set as a dedicated
+              calibration fold, fit the booster on the earlier portion,
+              purge fit rows whose label span reaches into the calibration
+              fold (when ``events`` is supplied), and fit the 1-D calibrator
+              (isotonic >= 2k train events, else sigmoid) on genuinely
+              out-of-fold predictions. This is what G5 (§7) is designed to
+              reward and the recommended path once pooled n clears ~2k.
+
+        calib_frac: Fraction of the (time-ordered) training set reserved as
+            the calibration fold under ``calibration="holdout"``.
         seed: RNG seed.
+
+    Note:
+        ``calibration="holdout"`` assumes ``features`` (and ``events``, if
+        given) are in ascending time order — the calibration fold is the
+        tail. Callers that build a purged train/test split upstream (e.g.
+        ``scripts/run_phase3.py``) already satisfy this.
 
     Returns:
         :class:`MetaModelResult` with AUC, Brier, reliability, etc.
@@ -218,29 +262,100 @@ def train_meta_model(
     p["min_child_samples"] = max(30, int(0.03 * len(X_tr)))
     cat_kwargs = {"categorical_feature": cat_idx} if cat_idx else {}
 
-    if calibrate:
+    if calibrate and calibration not in ("cv", "holdout"):
+        raise ValueError(
+            f"calibration must be 'cv' or 'holdout', got {calibration!r}"
+        )
+
+    if calibrate and calibration == "holdout":
+        # §6: fit the calibrator on a DEDICATED, PURGED calibration fold —
+        # not via internal CV on the training data. The booster fits on the
+        # earlier portion of the (time-ordered) training set; the calibrator
+        # fits on genuinely out-of-fold predictions over the tail fold.
+        method = "isotonic" if len(X_tr) >= 2000 else "sigmoid"
+        n_calib = max(1, int(round(len(X_tr) * calib_frac)))
+        calib_pos = np.arange(len(X_tr) - n_calib, len(X_tr))
+        fit_pos = np.arange(0, len(X_tr) - n_calib)
+
+        # Purge fit rows whose label span reaches into the calibration fold.
+        if events is not None and len(events) == len(X_tr):
+            ev = events.reset_index(drop=True)
+            calib_start = pd.to_datetime(ev.iloc[calib_pos]["t0"]).min()
+            t1 = pd.to_datetime(ev.iloc[fit_pos]["t1"])
+            # Keep only fit rows fully resolved before the calibration fold
+            # opens (NaT t1 -> unresolved -> conservatively dropped).
+            keep = (t1 < calib_start).fillna(False).to_numpy()
+            fit_pos = fit_pos[keep]
+        else:
+            # No event spans available: apply a small positional embargo gap
+            # between the fit set and the calibration fold to blunt serial
+            # correlation leakage.
+            gap = min(len(fit_pos), max(0, min(50, int(0.05 * len(X_tr)))))
+            if gap:
+                fit_pos = fit_pos[:-gap]
+
+        calib_ok = (
+            len(fit_pos) >= 50
+            and len(calib_pos) >= 20
+            and np.unique(y_tr[fit_pos]).size == 2
+            and np.unique(y_tr[calib_pos]).size == 2
+        )
+        if calib_ok:
+            dtrain = lgb.Dataset(
+                X_tr[fit_pos], label=y_tr[fit_pos], weight=w_tr[fit_pos], **cat_kwargs
+            )
+            model = lgb.train(p, dtrain, num_boost_round=300)
+            calib_raw = model.predict(X_tr[calib_pos])
+            test_raw = model.predict(X_te)
+
+            if method == "isotonic":
+                from sklearn.isotonic import IsotonicRegression
+
+                iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+                iso.fit(calib_raw, y_tr[calib_pos], sample_weight=w_tr[calib_pos])
+                test_pred = iso.predict(test_raw)
+            else:
+                from sklearn.linear_model import LogisticRegression
+
+                lr = LogisticRegression()
+                lr.fit(
+                    calib_raw.reshape(-1, 1),
+                    y_tr[calib_pos],
+                    sample_weight=w_tr[calib_pos],
+                )
+                test_pred = lr.predict_proba(test_raw.reshape(-1, 1))[:, 1]
+
+            fit_pos_len = len(fit_pos)
+            val_pos_len = len(calib_pos)
+        else:
+            # Degenerate fold (single-class or too small) -> fall back to the
+            # CV calibrator rather than emit uncalibrated probabilities.
+            calibration = "cv"
+
+    if calibrate and calibration == "cv":
         from sklearn.calibration import CalibratedClassifierCV
-        # Use cross-validated Isotonic Regression (as requested by user / architecture)
-        # to ensure calibration is robust against any single noisy time fold.
+        # Cross-validated calibrator over the training data (back-compat path;
+        # reproduces Phase 1/2). Isotonic >= 2k events, else Platt sigmoid.
         p_clf = p.copy()
         p_clf.pop("n_estimators", None)
         clf = lgb.LGBMClassifier(**p_clf, n_estimators=300, n_jobs=-1, random_state=42)
-        
+
         if len(X_tr) >= 2000:
             calibrator = CalibratedClassifierCV(clf, cv=5, method="isotonic")
         else:
             calibrator = CalibratedClassifierCV(clf, cv=5, method="sigmoid")
-            
+
         calibrator.fit(X_tr, y_tr, sample_weight=w_tr)
         test_pred = calibrator.predict_proba(X_te)[:, 1]
-        
+
         # Fit a single booster on all data so the caller can extract feature importances
         dtrain_full = lgb.Dataset(X_tr, label=y_tr, weight=w_tr, **cat_kwargs)
         model = lgb.train(p, dtrain_full, num_boost_round=300)
-        
+
         fit_pos_len = len(X_tr)
         val_pos_len = 0
-    else:
+
+    if not calibrate:
         n_val = max(1, len(X_tr) // 4)
         val_pos = np.arange(len(X_tr) - n_val, len(X_tr))
         fit_pos = np.setdiff1d(np.arange(len(X_tr)), val_pos)
