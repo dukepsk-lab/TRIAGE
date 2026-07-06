@@ -83,10 +83,15 @@ def backfill_symbol_events(symbol: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-def load_pooled_events() -> pd.DataFrame:
-    """Load all events, unpack features, apply Tier 4."""
+def load_pooled_events(symbols: list[str] | None = None) -> pd.DataFrame:
+    """Load all events, unpack features, apply Tier 4.
+
+    ``symbols`` defaults to ``PHASE3_SYMBOLS`` (back-compat); pass an explicit
+    list to pool an arbitrary basket (used by the basket-comparison harness).
+    """
+    symbols = symbols if symbols is not None else PHASE3_SYMBOLS
     df = load_events(DEFAULT_EVENTS_DB)
-    df = df[df["symbol"].isin(PHASE3_SYMBOLS)].copy()
+    df = df[df["symbol"].isin(symbols)].copy()
     
     feats = pd.DataFrame([json.loads(f) if isinstance(f, str) else f for f in df["features"]]).set_index(df.index)
     feat_cols = [c for c in FEATURE_COLUMNS if c in feats.columns]
