@@ -73,6 +73,36 @@ class MetaModelResult:
     oof_pred: Optional[np.ndarray] = None  # out-of-fold predictions
 
 
+def _fit_1d_calibrator(cr: np.ndarray, yc: np.ndarray, wc: np.ndarray, method: str):
+    """Fit one 1-D probability calibrator on (raw_score, label, weight).
+
+    Returns the fitted estimator, or ``None`` if the fold is degenerate
+    (single-class or <10 rows). Shared by :func:`train_meta_model` (holdout
+    calibration) and :class:`triage.paper.PaperStrategy` so the frozen paper
+    model is byte-for-byte the promotable model, not a re-fit approximation.
+    """
+    if len(np.unique(yc)) < 2 or len(cr) < 10:
+        return None
+    if method == "isotonic":
+        from sklearn.isotonic import IsotonicRegression
+
+        est = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+        est.fit(cr, yc, sample_weight=wc)
+        return est
+    from sklearn.linear_model import LogisticRegression
+
+    est = LogisticRegression()
+    est.fit(cr.reshape(-1, 1), yc, sample_weight=wc)
+    return est
+
+
+def _apply_1d_calibrator(est, method: str, raw: np.ndarray) -> np.ndarray:
+    """Apply a calibrator fit by :func:`_fit_1d_calibrator` to raw scores."""
+    if method == "isotonic":
+        return np.asarray(est.predict(raw), dtype=float)
+    return est.predict_proba(raw.reshape(-1, 1))[:, 1]
+
+
 def reliability_curve(
     y_true: np.ndarray, y_pred: np.ndarray, n_bins: int = 10
 ) -> dict[int, tuple[float, float, int]]:
@@ -155,6 +185,7 @@ def train_meta_model(
     calib_frac: float = 0.2,
     calib_method: Optional[str] = None,
     per_symbol_calib: bool = False,
+    _capture: Optional[dict] = None,
     seed: int = 0,
 ) -> MetaModelResult:
     """Train the LightGBM meta-model with purged OOS evaluation.
@@ -318,26 +349,23 @@ def train_meta_model(
             calib_raw = model.predict(X_tr[calib_pos])
             test_raw = model.predict(X_te)
 
-            def _fit_apply(cr, yc, wc, tr_raw, mthd):
-                """Fit one 1-D calibrator on (cr, yc, wc); apply to tr_raw."""
-                if len(np.unique(yc)) < 2 or len(cr) < 10:
-                    return None  # degenerate -> caller falls back
-                if mthd == "isotonic":
-                    from sklearn.isotonic import IsotonicRegression
-
-                    iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
-                    iso.fit(cr, yc, sample_weight=wc)
-                    return iso.predict(tr_raw)
-                from sklearn.linear_model import LogisticRegression
-
-                lr = LogisticRegression()
-                lr.fit(cr.reshape(-1, 1), yc, sample_weight=wc)
-                return lr.predict_proba(tr_raw.reshape(-1, 1))[:, 1]
-
-            # Pooled calibrator (always fit — also the per-symbol fallback).
-            pooled_pred = _fit_apply(
-                calib_raw, y_tr[calib_pos], w_tr[calib_pos], test_raw, method
+            pooled_est = _fit_1d_calibrator(
+                calib_raw, y_tr[calib_pos], w_tr[calib_pos], method
             )
+            pooled_pred = (
+                _apply_1d_calibrator(pooled_est, method, test_raw)
+                if pooled_est is not None else None
+            )
+
+            # Expose the fitted artifacts for a frozen deployable strategy
+            # (triage.paper) — additive; a no-op unless a _capture dict is passed.
+            if _capture is not None and pooled_est is not None:
+                _capture.update(
+                    booster=model, calibrator=pooled_est, method=method,
+                    feature_names=list(features.columns), cat_cols=list(cat_cols),
+                    cat_levels={c: features[c].cat.categories for c in cat_cols},
+                    fit_n=int(len(fit_pos)), calib_n=int(len(calib_pos)),
+                )
 
             if (
                 per_symbol_calib
@@ -349,8 +377,7 @@ def train_meta_model(
                 # symbol's calibration-fold rows, applied to its test rows.
                 # Symbols with too-few / single-class calib rows fall back to
                 # the pooled calibrator (no symbol is left uncalibrated).
-                sym_tr = features["symbol"].astype(str).to_numpy()
-                sym_calib = sym_tr[calib_pos]
+                sym_calib = features["symbol"].astype(str).to_numpy()[calib_pos]
                 sym_test = test_features["symbol"].astype(str).to_numpy()
                 test_pred = np.array(pooled_pred, dtype=float)
                 for s in np.unique(sym_test):
@@ -358,12 +385,11 @@ def train_meta_model(
                     tm = sym_test == s
                     if not tm.any():
                         continue
-                    sub = _fit_apply(
-                        calib_raw[cm], y_tr[calib_pos][cm], w_tr[calib_pos][cm],
-                        test_raw[tm], method,
+                    est_s = _fit_1d_calibrator(
+                        calib_raw[cm], y_tr[calib_pos][cm], w_tr[calib_pos][cm], method
                     )
-                    if sub is not None:
-                        test_pred[tm] = sub  # else keep pooled fallback
+                    if est_s is not None:
+                        test_pred[tm] = _apply_1d_calibrator(est_s, method, test_raw[tm])
             else:
                 test_pred = pooled_pred
 
