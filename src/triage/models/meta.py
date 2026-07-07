@@ -153,6 +153,8 @@ def train_meta_model(
     calibrate: bool = True,
     calibration: str = "cv",
     calib_frac: float = 0.2,
+    calib_method: Optional[str] = None,
+    per_symbol_calib: bool = False,
     seed: int = 0,
 ) -> MetaModelResult:
     """Train the LightGBM meta-model with purged OOS evaluation.
@@ -272,7 +274,15 @@ def train_meta_model(
         # not via internal CV on the training data. The booster fits on the
         # earlier portion of the (time-ordered) training set; the calibrator
         # fits on genuinely out-of-fold predictions over the tail fold.
-        method = "isotonic" if len(X_tr) >= 2000 else "sigmoid"
+        # §5/§6 sanctioned calibration levers: the method may be forced
+        # (isotonic<->sigmoid) rather than auto-picked by the ~2k rule, and the
+        # calibrator may be fit per-symbol. Both are used by the G5 calibration
+        # sweep; defaults reproduce the prior auto behavior exactly.
+        method = (
+            calib_method
+            if calib_method in ("isotonic", "sigmoid")
+            else ("isotonic" if len(X_tr) >= 2000 else "sigmoid")
+        )
         n_calib = max(1, int(round(len(X_tr) * calib_frac)))
         calib_pos = np.arange(len(X_tr) - n_calib, len(X_tr))
         fit_pos = np.arange(0, len(X_tr) - n_calib)
@@ -308,22 +318,54 @@ def train_meta_model(
             calib_raw = model.predict(X_tr[calib_pos])
             test_raw = model.predict(X_te)
 
-            if method == "isotonic":
-                from sklearn.isotonic import IsotonicRegression
+            def _fit_apply(cr, yc, wc, tr_raw, mthd):
+                """Fit one 1-D calibrator on (cr, yc, wc); apply to tr_raw."""
+                if len(np.unique(yc)) < 2 or len(cr) < 10:
+                    return None  # degenerate -> caller falls back
+                if mthd == "isotonic":
+                    from sklearn.isotonic import IsotonicRegression
 
-                iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
-                iso.fit(calib_raw, y_tr[calib_pos], sample_weight=w_tr[calib_pos])
-                test_pred = iso.predict(test_raw)
-            else:
+                    iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+                    iso.fit(cr, yc, sample_weight=wc)
+                    return iso.predict(tr_raw)
                 from sklearn.linear_model import LogisticRegression
 
                 lr = LogisticRegression()
-                lr.fit(
-                    calib_raw.reshape(-1, 1),
-                    y_tr[calib_pos],
-                    sample_weight=w_tr[calib_pos],
-                )
-                test_pred = lr.predict_proba(test_raw.reshape(-1, 1))[:, 1]
+                lr.fit(cr.reshape(-1, 1), yc, sample_weight=wc)
+                return lr.predict_proba(tr_raw.reshape(-1, 1))[:, 1]
+
+            # Pooled calibrator (always fit — also the per-symbol fallback).
+            pooled_pred = _fit_apply(
+                calib_raw, y_tr[calib_pos], w_tr[calib_pos], test_raw, method
+            )
+
+            if (
+                per_symbol_calib
+                and test_features is not None
+                and "symbol" in features.columns
+                and "symbol" in test_features.columns
+            ):
+                # §6 lever: a separate calibrator per symbol, fit on that
+                # symbol's calibration-fold rows, applied to its test rows.
+                # Symbols with too-few / single-class calib rows fall back to
+                # the pooled calibrator (no symbol is left uncalibrated).
+                sym_tr = features["symbol"].astype(str).to_numpy()
+                sym_calib = sym_tr[calib_pos]
+                sym_test = test_features["symbol"].astype(str).to_numpy()
+                test_pred = np.array(pooled_pred, dtype=float)
+                for s in np.unique(sym_test):
+                    cm = sym_calib == s
+                    tm = sym_test == s
+                    if not tm.any():
+                        continue
+                    sub = _fit_apply(
+                        calib_raw[cm], y_tr[calib_pos][cm], w_tr[calib_pos][cm],
+                        test_raw[tm], method,
+                    )
+                    if sub is not None:
+                        test_pred[tm] = sub  # else keep pooled fallback
+            else:
+                test_pred = pooled_pred
 
             fit_pos_len = len(fit_pos)
             val_pos_len = len(calib_pos)

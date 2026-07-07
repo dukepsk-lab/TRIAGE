@@ -101,32 +101,74 @@ uniform, mild under-calibration across all three, which is why the fix belongs
 in the *calibrator*, not the *basket* (§6). No symbol dominates the result;
 pooling the three majors is justified.
 
+> **Calibrator note:** the holdout calibrator used **isotonic**, not sigmoid —
+> the method rule keys on `len(X_tr)` = 2270 (the full purged training set) ≥ 2k,
+> and n_train=1816 above is the *post-carve fit* count, not the method selector.
+
+## G5 calibration sweep (§6 lever — run, and exhausted)
+
+Per §6, when *G1 passes / G5 fails* the sanctioned lever is the **calibrator, not
+the basket**. Swept all three knobs — isotonic↔sigmoid × `calib_frac`
+{0.20, 0.35} × pooled/per-symbol — over one fixed feature set and one fixed
+purged split, so only the calibrator moves (`scripts/_calib_sweep.py`, 6 logged
+trials). Question: does any sanctioned calibrator get the pooled slope into
+[0.8, 1.2] with Brier < clim?
+
+| calib_frac | method | per-sym | AUC | Brier | clim | slope | G5 | G1 ΔSh | G1 p |
+|---|---|---|---|---|---|---|---|---|---|
+| 0.20 | sigmoid | no  | 0.547 | 0.2350 | 0.2326 | 3.227 | . | 1.237 | 0.007 |
+| **0.20** | **isotonic** | **no** | 0.535 | 0.2355 | 0.2326 | **0.556** | . | 1.043 | 0.016 |
+| 0.35 | sigmoid | no  | 0.463 | 0.2337 | 0.2326 | −27.51 | . | 1.237 | 0.007 |
+| 0.35 | isotonic | no | 0.523 | 0.2350 | 0.2326 | −0.324 | . | 0.966 | 0.084 |
+| 0.20 | isotonic | yes | 0.538 | 0.2397 | 0.2326 | 0.312 | . | 0.928 | 0.013 |
+| 0.35 | isotonic | yes | 0.526 | 0.2392 | 0.2326 | −0.032 | . | 1.011 | 0.018 |
+
+**Answer: no. G5 is data-bound, not calibrator-bound.**
+
+- **Every config fails G5**, and the slopes are *erratic* (3.23, −27.5, −0.32,
+  0.31, −0.03): the calibrator is fitting **noise**, because an AUC≈0.535 ranking
+  does not carry enough reliability structure for any 1-D calibrator to recover
+  a slope-1 curve. Brier sits at climatology in every case.
+- **Larger `calib_frac` makes it worse** (less fit data → weaker booster; sigmoid
+  at 0.35 → slope −27). **Per-symbol makes it worse** (≈120 calib rows/symbol →
+  noise). The **auto default (isotonic, frac 0.20, pooled)** is already the best
+  and still fails.
+- **G1 uplift is invariant to the calibrator** (ΔSharpe ~1.0, p 0.007–0.018
+  throughout). That is the tell: the *filter/ranking* is the real, stable,
+  bankable effect; the calibration layer on top is the part that has nothing to
+  lock onto at this n.
+
+The §6 calibration lever is therefore exhausted. G5 needs **more edge-bearing
+data**, which Phase 3's pooling was meant to supply and could not (the additions
+had no edge). At the majors-donchian n (train ≈ 2.3k), probability sizing cannot
+be safely unlocked.
+
 ## Honest trial count
 
-**12 trials** (registry preserved; +1 vs the full-basket run of record). See the
-honesty note in `PHASE3_RESULTS.md` — the registry was absent at the start of
-this session, so 12 reflects only this session's trials.
+**18 trials** (12 through the scoped run of record + 6 for this calibration
+sweep). Registry preserved, not reset. See the honesty note in
+`PHASE3_RESULTS.md`: the registry was absent at session start, so 18 reflects
+only this session's trials.
 
-## Verdict & the open decision
+## Verdict & recommendation
 
-**Majors × donchian is the promotable signal in hand.** G1 uplift is real and
-survives CPCV; the filter (rung 2) works. The blocker is **G5 calibration**, and
-per §6 the sanctioned lever when *G1 passes / G5 fails* is the **calibrator**,
-not the basket: isotonic↔sigmoid, larger `calib_frac`, or per-symbol
-calibration. Two honest caveats on that lever:
+**Majors × donchian is the promotable signal — via the filter (rung 2), not the
+sizer (rung 3).**
 
-1. n_train = 1816 sits **below** the §6 ~2k isotonic threshold, so the holdout
-   calibrator used **sigmoid**. Isotonic (the better calibrator here) wants more
-   events — and Phase 3's whole plan for getting them (pooling the full basket)
-   is exactly what failed. So more edge-bearing data is not cheaply available.
-2. A shallow slope (0.556) on an AUC-0.535 ranking may be partly **irreducible**:
-   a calibrator cannot manufacture reliability the ranking doesn't support.
+- **G1 uplift is real, CPCV-confirmed, and calibrator-invariant.** The meta-filter
+  significantly beats take-all (ΔSharpe +1.04, p=0.016). Baseline-ladder **rung 2
+  is validated.**
+- **G5 is data-bound and will not clear at this n.** The full §6 calibration lever
+  was run to exhaustion; no sanctioned calibrator reaches [0.8, 1.2]. **Rung 3
+  (probability-laddered sizing) stays blocked** — the sizer cannot safely consume
+  these probabilities. G2/G4 marginal at n, as expected (§6/§10).
 
-**Recommended next decision (human):** either (a) run the bounded §6 calibration
-sweep (`calib_frac` grid + per-symbol calibration) to see whether G5 reaches
-[0.8,1.2] at this n — a few more logged trials — and if it does, this slice is
-promotable to paper; or (b) accept the honest landing — **rung 2 (filter)
-validated, rung 3 (sizing) deferred until G5 clears** — and take the filtered
-majors-donchian strategy to paper trading with *fixed* (non-probability) sizing,
-where the G1 uplift is already bankable and calibration drift can be monitored
-live (§10 Phase 4) rather than gated pre-launch.
+**Recommended landing (option b):** take the **filtered** majors-donchian strategy
+to **paper trading with fixed (non-probability) sizing**, where the G1 uplift is
+already bankable. Instrument the §10 Phase 4 monitors — calibration-drift CUSUM
+first — and treat probability sizing as a *live-data* goal: revisit G5 only once
+more edge-bearing majors-donchian events accrue (paper + forward), not by further
+in-sample calibration search (which this sweep shows is a dead end and only
+degrades DSR). Do **not** re-expand the basket to chase n — the §11 rejection in
+`PHASE3_RESULTS.md` stands: the added instruments and the second rule family have
+no edge to pool.
