@@ -182,19 +182,52 @@ BTC 0.527, GBPUSD 0.489, **US30 0.478**. Per-symbol AUC, full6/pullback: all
    forbidden (§6) and MDA already shows the features carry no edge. **The tree
    is exhausted.**
 
+## Per-stream G1 screen — does any addition clear G1 alone?
+
+The recommendation below is "make each added stream clear G1 *on its own* before
+pooling." Screening the additions individually (headline holdout, d4·15, one
+fixed split each; `scripts/_stream_screen.py`) makes that concrete:
+
+| stream | n | AUC | slope | G1 ΔSh | G1 p | G1 |
+|---|---|---|---|---|---|---|
+| **majors3 × donchian** (anchor) | 3247 | **0.543** | 0.556 | 1.043 | **0.016** | **PASS** |
+| XAUUSD × donchian | 834 | **0.448** | −3.27 | −3.540 | 1.000 | FAIL |
+| US30 × donchian | 671 | 0.512 | 1.330 | −0.430 | 0.646 | FAIL |
+| BTCUSD × donchian | 679 | **0.417** | −1.923 | −0.406 | 0.670 | FAIL |
+| majors3 × pullback | 2577 | **0.474** | −0.565 | 1.622 | 0.022 | PASS\* |
+
+- **Every added instrument on donchian is edgeless.** US30 ~chance (0.512);
+  **XAU (0.448) and BTC (0.417) are actively anti-signal** — the filter *hurts*
+  (XAU ΔSharpe −3.5, p=1.000). These streams have nothing to pool.
+- **\* majors × pullback's G1 "pass" is spurious.** AUC 0.474 is *below chance* —
+  there is **no ranking edge**. The positive ΔSharpe comes from the degenerate
+  case §0 warns about: filtering a *losing* primary (pullback take-all bleeds
+  post-cost) cuts exposure and mechanically lifts the variance-scaled return,
+  without any conditional skill. G1 read **without** a ranking check (AUC/G5) is
+  fooled here. Contrast the anchor: majors × donchian passes G1 *and* has genuine
+  ranking edge (AUC 0.543). **The pullback family is not promotable.**
+- Takeaway: the edge is **majors × donchian specifically**. Pooling any of the
+  additions in is what collapsed the pooled p̂ to chance. This is the per-stream
+  substantiation of the §11 rejection.
+
 ## Honest trial count
 
-**11 trials**, from `.triage/registry.sqlite`.
+**11 trials at the time the full-basket gate table above was computed** (its
+G2 DSR used n_trials=11). The running session total after the follow-up work
+(majors-donchian scoped run of record, the G5 calibration sweep, and this
+per-stream screen) is **22** — see `MAJORS_DONCHIAN_RESULTS.md`. All from
+`.triage/registry.sqlite`, monotonically accumulating; nothing was reset.
 
 > **Important honesty note.** `.triage/` is gitignored and **did not exist in
 > this checkout** — no bar store, no registry. The Phase 1/2 documents cite
 > honest counts of 8 and 10, but that registry was never committed and is not
 > present here. This run therefore started the registry from zero; **11 reflects
-> only tonight's trials** (4 basket-comparison cells + 6 decision-tree
-> diagnostic cells + 1 run-of-record). The registry was **not** deleted or
-> reset to lower the count (§4) — it was genuinely absent. DSR/PBO are computed
-> against this honest 11; if the intent is to carry Phase 1/2 history, the count
-> should be ≥ 10 higher and G2 becomes *harder*, not easier.
+> only this session's trials up to the full-basket run of record** (4 basket-
+> comparison cells + 6 decision-tree diagnostic cells + 1 run-of-record). The
+> registry was **not** deleted or reset to lower the count (§4) — it was
+> genuinely absent. DSR/PBO are computed against this honest count; if the intent
+> is to carry Phase 1/2 history, the count should be ≥ 10 higher and G2 becomes
+> *harder*, not easier.
 
 ## Recommendation / Verdict
 
