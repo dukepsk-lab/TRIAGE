@@ -46,8 +46,16 @@ def backfill_symbol_events(symbol: str) -> int:
     has_pullback = False
     if len(existing) > 0:
         sym_events = existing[existing["symbol"] == symbol]
-        has_donchian = "donchian" in sym_events["rule_id"].values if len(sym_events) > 0 else False
-        has_pullback = "htf_pullback" in sym_events["rule_id"].values if len(sym_events) > 0 else False
+        # Match on the ACTUAL stored rule_id strings. Donchian events are
+        # persisted with rule_id="donchian20" (the build_events_for_signals
+        # default) and pullback with "htf_pullback". A prior exact-membership
+        # check for "donchian" never matched -> re-runs silently DUPLICATED
+        # donchian events (persist_events INSERTs, it does not upsert). Both
+        # run_basket_comparison.py and run_phase3.py call this, so idempotency
+        # is load-bearing.
+        rule_ids = set(sym_events["rule_id"]) if len(sym_events) > 0 else set()
+        has_donchian = any(str(r).startswith("donchian") for r in rule_ids)
+        has_pullback = any("pullback" in str(r) for r in rule_ids)
 
     if has_donchian and has_pullback:
         print(f"[phase3] {symbol}: events already present, skipping")
@@ -223,8 +231,11 @@ def main() -> None:
     kept_corr = correlation_prune(X_candidates)
     print(f"Post-correlation features: {len(kept_corr)} / {len(candidate_features)}")
     
-    mda_res = mda_selection(X_candidates[kept_corr], train["label"], train)
-    print("MDA Results:\n", mda_res)
+    # §5: select on "mean OOS trade EV, not raw AUC". The ev branch now
+    # computes realized r-based captured trade EV (fixed from the prior
+    # mean-predicted-probability bug). MDI/gain stays diagnostic-only.
+    mda_res = mda_selection(X_candidates[kept_corr], train["label"], train, metric="ev")
+    print("MDA Results (metric=ev, realized trade EV per §5):\n", mda_res)
     
     kept_mda = mda_res[mda_res["kept"]]["feature"].tolist()
     tier4_kept = [c for c in kept_mda if c in TIER4_COLUMNS]

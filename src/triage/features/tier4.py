@@ -160,6 +160,48 @@ def mda_selection(
     from sklearn.metrics import roc_auc_score
     from ..validation import purged_train_idx, DEFAULT_EMBARGO_BARS
 
+    if metric not in ("auc", "ev"):
+        raise ValueError(f"metric must be 'auc' or 'ev', got {metric!r}")
+
+    # §5 "mean OOS trade EV" needs realized returns, not predicted
+    # probabilities. Pull r_realized (+ per-symbol cost) straight off the
+    # aligned ``events`` frame. The historical bug was that the "ev" branch
+    # returned mean predicted probability — a quantity that has nothing to do
+    # with trade profitability and would "keep" whatever feature most shifts
+    # p-hat, regardless of whether that shift is toward money.
+    ev_r_all = None
+    ev_cost_all = None
+    tau0_ev = None
+    if metric == "ev":
+        from ..gates import cost_for_symbol, MAJOR_COST_R
+        from ..sizing import default_tau0
+
+        if "r_realized" not in events.columns:
+            raise ValueError(
+                "metric='ev' requires an 'r_realized' column on events "
+                "(realized R-multiple per event) to compute trade EV (§5)."
+            )
+        ev_r_all = pd.to_numeric(events["r_realized"], errors="coerce").fillna(0.0).to_numpy()
+        if "symbol" in events.columns:
+            ev_cost_all = np.array([cost_for_symbol(str(s)) for s in events["symbol"]])
+        else:
+            ev_cost_all = np.full(len(events), MAJOR_COST_R)
+        tau0_ev = default_tau0(float(np.median(ev_cost_all)))
+
+    def _captured_ev(pred: np.ndarray, r_te: np.ndarray, cost_te: np.ndarray) -> float:
+        """Mean captured trade EV: (r - cost) over taken trades, else 0.
+
+        Taken = calibrated-conviction filter at tau0 (the strategy's own
+        breakeven+margin threshold, §8). If tau0 selects too few in a fold
+        to be informative, fall back to the top-40%-by-conviction slice so
+        the fold still discriminates the feature's ranking contribution.
+        """
+        taken = pred >= tau0_ev
+        if int(taken.sum()) < 5:
+            thr = np.quantile(pred, 0.6)
+            taken = pred >= thr
+        return float(np.mean(np.where(taken, r_te - cost_te, 0.0)))
+
     rng = np.random.default_rng(seed)
     df_idx = np.arange(len(X))
     # Time-ordered fold boundaries.
@@ -204,14 +246,23 @@ def mda_selection(
 
         model = lgb.train(p, lgb.Dataset(X_tr, label=y_tr), num_boost_round=100)
         base_pred = model.predict(X_te)
-        baseline = roc_auc_score(y_te, base_pred) if metric == "auc" else float(np.mean(base_pred))
+        if metric == "auc":
+            baseline = roc_auc_score(y_te, base_pred)
+            r_te = cost_te = None
+        else:
+            r_te = ev_r_all[test_pos]
+            cost_te = ev_cost_all[test_pos]
+            baseline = _captured_ev(base_pred, r_te, cost_te)
 
         for fi_idx, feat in enumerate(features):
             X_te_perm = X_te.copy()
             perm = rng.permutation(len(X_te_perm))
             X_te_perm[:, fi_idx] = X_te_perm[perm, fi_idx]
             pred_p = model.predict(X_te_perm)
-            val_p = roc_auc_score(y_te, pred_p) if metric == "auc" else float(np.mean(pred_p))
+            if metric == "auc":
+                val_p = roc_auc_score(y_te, pred_p)
+            else:
+                val_p = _captured_ev(pred_p, r_te, cost_te)
             mda_drops[feat].append(baseline - val_p)  # positive = feature helped
 
     # Summarize: mean drop + CI, keep if CI doesn't span zero.

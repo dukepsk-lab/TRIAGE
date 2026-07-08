@@ -73,6 +73,36 @@ class MetaModelResult:
     oof_pred: Optional[np.ndarray] = None  # out-of-fold predictions
 
 
+def _fit_1d_calibrator(cr: np.ndarray, yc: np.ndarray, wc: np.ndarray, method: str):
+    """Fit one 1-D probability calibrator on (raw_score, label, weight).
+
+    Returns the fitted estimator, or ``None`` if the fold is degenerate
+    (single-class or <10 rows). Shared by :func:`train_meta_model` (holdout
+    calibration) and :class:`triage.paper.PaperStrategy` so the frozen paper
+    model is byte-for-byte the promotable model, not a re-fit approximation.
+    """
+    if len(np.unique(yc)) < 2 or len(cr) < 10:
+        return None
+    if method == "isotonic":
+        from sklearn.isotonic import IsotonicRegression
+
+        est = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
+        est.fit(cr, yc, sample_weight=wc)
+        return est
+    from sklearn.linear_model import LogisticRegression
+
+    est = LogisticRegression()
+    est.fit(cr.reshape(-1, 1), yc, sample_weight=wc)
+    return est
+
+
+def _apply_1d_calibrator(est, method: str, raw: np.ndarray) -> np.ndarray:
+    """Apply a calibrator fit by :func:`_fit_1d_calibrator` to raw scores."""
+    if method == "isotonic":
+        return np.asarray(est.predict(raw), dtype=float)
+    return est.predict_proba(raw.reshape(-1, 1))[:, 1]
+
+
 def reliability_curve(
     y_true: np.ndarray, y_pred: np.ndarray, n_bins: int = 10
 ) -> dict[int, tuple[float, float, int]]:
@@ -153,6 +183,9 @@ def train_meta_model(
     calibrate: bool = True,
     calibration: str = "cv",
     calib_frac: float = 0.2,
+    calib_method: Optional[str] = None,
+    per_symbol_calib: bool = False,
+    _capture: Optional[dict] = None,
     seed: int = 0,
 ) -> MetaModelResult:
     """Train the LightGBM meta-model with purged OOS evaluation.
@@ -272,7 +305,15 @@ def train_meta_model(
         # not via internal CV on the training data. The booster fits on the
         # earlier portion of the (time-ordered) training set; the calibrator
         # fits on genuinely out-of-fold predictions over the tail fold.
-        method = "isotonic" if len(X_tr) >= 2000 else "sigmoid"
+        # §5/§6 sanctioned calibration levers: the method may be forced
+        # (isotonic<->sigmoid) rather than auto-picked by the ~2k rule, and the
+        # calibrator may be fit per-symbol. Both are used by the G5 calibration
+        # sweep; defaults reproduce the prior auto behavior exactly.
+        method = (
+            calib_method
+            if calib_method in ("isotonic", "sigmoid")
+            else ("isotonic" if len(X_tr) >= 2000 else "sigmoid")
+        )
         n_calib = max(1, int(round(len(X_tr) * calib_frac)))
         calib_pos = np.arange(len(X_tr) - n_calib, len(X_tr))
         fit_pos = np.arange(0, len(X_tr) - n_calib)
@@ -308,22 +349,49 @@ def train_meta_model(
             calib_raw = model.predict(X_tr[calib_pos])
             test_raw = model.predict(X_te)
 
-            if method == "isotonic":
-                from sklearn.isotonic import IsotonicRegression
+            pooled_est = _fit_1d_calibrator(
+                calib_raw, y_tr[calib_pos], w_tr[calib_pos], method
+            )
+            pooled_pred = (
+                _apply_1d_calibrator(pooled_est, method, test_raw)
+                if pooled_est is not None else None
+            )
 
-                iso = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
-                iso.fit(calib_raw, y_tr[calib_pos], sample_weight=w_tr[calib_pos])
-                test_pred = iso.predict(test_raw)
-            else:
-                from sklearn.linear_model import LogisticRegression
-
-                lr = LogisticRegression()
-                lr.fit(
-                    calib_raw.reshape(-1, 1),
-                    y_tr[calib_pos],
-                    sample_weight=w_tr[calib_pos],
+            # Expose the fitted artifacts for a frozen deployable strategy
+            # (triage.paper) — additive; a no-op unless a _capture dict is passed.
+            if _capture is not None and pooled_est is not None:
+                _capture.update(
+                    booster=model, calibrator=pooled_est, method=method,
+                    feature_names=list(features.columns), cat_cols=list(cat_cols),
+                    cat_levels={c: features[c].cat.categories for c in cat_cols},
+                    fit_n=int(len(fit_pos)), calib_n=int(len(calib_pos)),
                 )
-                test_pred = lr.predict_proba(test_raw.reshape(-1, 1))[:, 1]
+
+            if (
+                per_symbol_calib
+                and test_features is not None
+                and "symbol" in features.columns
+                and "symbol" in test_features.columns
+            ):
+                # §6 lever: a separate calibrator per symbol, fit on that
+                # symbol's calibration-fold rows, applied to its test rows.
+                # Symbols with too-few / single-class calib rows fall back to
+                # the pooled calibrator (no symbol is left uncalibrated).
+                sym_calib = features["symbol"].astype(str).to_numpy()[calib_pos]
+                sym_test = test_features["symbol"].astype(str).to_numpy()
+                test_pred = np.array(pooled_pred, dtype=float)
+                for s in np.unique(sym_test):
+                    cm = sym_calib == s
+                    tm = sym_test == s
+                    if not tm.any():
+                        continue
+                    est_s = _fit_1d_calibrator(
+                        calib_raw[cm], y_tr[calib_pos][cm], w_tr[calib_pos][cm], method
+                    )
+                    if est_s is not None:
+                        test_pred[tm] = _apply_1d_calibrator(est_s, method, test_raw[tm])
+            else:
+                test_pred = pooled_pred
 
             fit_pos_len = len(fit_pos)
             val_pos_len = len(calib_pos)
