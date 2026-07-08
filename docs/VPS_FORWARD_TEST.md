@@ -96,10 +96,46 @@ naked rule's −91R into +13R on the held-out fold (Sharpe +0.64, +11.7% equity 
 per week per symbol). Judge it over months, not days, and on **parity + G1-style
 uplift vs take-all**, not on any single week.
 
-## Stage B (later): real demo orders
+## Stage B: real demo orders
 
-Once shadow is clean, Stage B is a thin adapter that sends the *taken* decisions
-to the terminal via `mt5.order_send` with TP/SL attached (barrier prices are
-already on each decision row), letting the broker resolve fills so you capture
-real spread/slippage. Same `decide()`; only the execution sink changes. Keep
-**fixed sizing** until G5 clears on the accumulated live data.
+Once shadow is clean, Stage B places actual orders via `scripts/live_execute.py`.
+It detects the Donchian signal on the just-closed H4 bar (features are all ≤ t0,
+so no entry-bar wait), decides with the same `decide()`, sizes the position from
+a risk budget (`triage.execution.broker.compute_lot`), and sends a **market order
+with TP/SL attached**. It closes positions at the 96h vertical barrier and
+reconciles TP/SL-closed positions into `.triage\orders.sqlite`.
+
+### Safety — read this before `--live`
+
+- **`--dry-run` is the DEFAULT.** Without `--live`, it computes and logs intended
+  orders and **sends nothing** (it still reads live ticks for realistic prices).
+- **It trades whatever account the running terminal is logged into.** Point the
+  VPS terminal at your **DEMO** account. Never run `--live` against a live one.
+- **Fixed sizing only** (rung 2). `--risk-frac 0.01` risks 1% equity per trade,
+  converted to lots from the symbol's tick economics; a budget too small for
+  `volume_min` at that SL is skipped (never over-risked).
+
+### Commands
+
+```bat
+:: 1) Dry-run first — verify signals, sizing, and intended orders (no sends)
+uv run python scripts/live_execute.py --once
+
+:: 2) Go live on the DEMO account (real order_send), forward, each H4 close
+uv run python scripts/live_execute.py --loop --live --risk-frac 0.01
+```
+
+Orders carry magic `20260708` so the loop only manages its own positions. TP/SL
+resolution is the broker's; the 96h vertical exit is enforced by the loop (so it
+must keep running — use NSSM/Task Scheduler for durability).
+
+### Inspecting orders
+
+```bat
+uv run python -c "import sqlite3,pandas as pd; c=sqlite3.connect('.triage/orders.sqlite'); \
+print(pd.read_sql('SELECT symbol,t0,side,lot,round(entry_px,5) entry,round(p_win,3) p,ticket,status,round(profit,2) profit FROM orders ORDER BY t0 DESC LIMIT 40', c).to_string(index=False))"
+```
+
+Run Stage B alongside (or instead of) the shadow loop. Keep it on demo and on
+fixed sizing until the accumulated live calibration data closes G5 — only then is
+probability sizing (rung 3) safe to switch on.
